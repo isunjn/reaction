@@ -7,7 +7,17 @@ type Bindings = {
   ORIGINS: string[];
   EMOJIS: string[];
   SLUGS: (string | [string, string[]])[];
+  DB: D1Database;
 };
+
+async function hashed(ip: string): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(ip),
+  );
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -20,32 +30,40 @@ app.use("*", (c, next) => {
   return corsMiddlewareHandler(c, next);
 });
 
-app.get("/", (c) => {
-  const uid = getConnInfo(c).remote.address;
+app.get("/", async (c) => {
+  const ip = getConnInfo(c).remote.address;
   const slug = c.req.query("slug");
-
-  if (!slug || !uid || typeof slug !== "string") {
+  if (!ip || !slug || typeof slug !== "string") {
     return c.json({ msg: "invalid request" }, 400);
   }
+  const uid = await hashed(ip);
 
   const valid = Object.fromEntries(
     c.env.SLUGS.map((slug) =>
       Array.isArray(slug) ? slug : [slug, c.env.EMOJIS],
     ),
   );
-
   if (!valid[slug]) {
     return c.json({ msg: "invalid slug" }, 400);
   }
 
-  // TODO:
-  const reacted = [];
-  const counts = {};
+  const queryed = await c.env.DB.batch<any>([
+    c.env.DB.prepare("SELECT emoji, count FROM counts WHERE slug = ?").bind(
+      slug,
+    ),
+    c.env.DB.prepare(
+      "SELECT emoji FROM reactions WHERE slug = ? AND uid = ?",
+    ).bind(slug, uid),
+  ]);
+  const counts = new Map(
+    queryed[0].results.map((row) => [row.emoji, row.count]),
+  );
+  const reacted = new Set(queryed[1].results.map((row) => row.emoji));
 
   const reaction = Object.fromEntries(
     valid[slug].map((emoji) => [
       emoji,
-      [counts[emoji] || 0, reacted.includes(emoji)],
+      [counts.get(emoji) || 0, reacted.has(emoji)],
     ]),
   );
 
@@ -53,11 +71,10 @@ app.get("/", (c) => {
 });
 
 app.post("/", async (c) => {
-  const uid = getConnInfo(c).remote.address;
+  const ip = getConnInfo(c).remote.address;
   const { slug, target, reacted } = await c.req.json();
-
   if (
-    !uid ||
+    !ip ||
     !slug ||
     !target ||
     typeof slug !== "string" ||
@@ -66,18 +83,49 @@ app.post("/", async (c) => {
   ) {
     return c.json({ msg: "invalid request" }, 400);
   }
+  const uid = await hashed(ip);
 
   const valid = Object.fromEntries(
     c.env.SLUGS.map((slug) =>
       Array.isArray(slug) ? slug : [slug, c.env.EMOJIS],
     ),
   );
-
   if (!valid[slug]) {
     return c.json({ msg: "invalid slug" }, 400);
   }
 
-  // TODO
+  const alreadyReacted = await c.env.DB.prepare(
+    "SELECT count(*) AS cnt FROM reactions WHERE slug = ? AND uid = ? AND emoji = ?",
+  )
+    .bind(slug, uid, target)
+    .first<number>("cnt");
+
+  if (reacted) {
+    if (alreadyReacted) {
+      return c.json({ msg: "already reacted" }, 400);
+    }
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "INSERT INTO reactions (slug, uid, emoji) VALUES (?, ?, ?)",
+      ).bind(slug, uid, target),
+      c.env.DB.prepare(
+        `INSERT INTO counts (slug, emoji, count) VALUES (?, ?, 1)
+         ON CONFLICT(slug, emoji) DO UPDATE SET count = count + 1`,
+      ).bind(slug, target),
+    ]);
+  } else {
+    if (!alreadyReacted) {
+      return c.json({ msg: "not reacted" }, 400);
+    }
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "DELETE FROM reactions WHERE slug = ? AND uid = ? AND emoji = ?",
+      ).bind(slug, uid, target),
+      c.env.DB.prepare(
+        `UPDATE counts SET count = count - 1 WHERE slug = ? AND emoji = ?`,
+      ).bind(slug, target),
+    ]);
+  }
 
   return c.json({ success: true });
 });
