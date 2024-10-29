@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS counts (
   slug TEXT NOT NULL,
   emoji TEXT NOT NULL,
-  count INTGER DEFAULT 0,
+  count INTGER NOT NULL,
   PRIMARY KEY (slug, emoji)
 );
 
